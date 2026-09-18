@@ -68,10 +68,14 @@ const productRoutes = require("./routes/productRoutes");
 const checkoutRoutes = require("./routes/checkoutRoutes");
 const adminRoutes = require("./routes/adminRoutes");
 const shippingRoutes = require("./routes/shippingRoutes");
+const otpRoutes = require("./routes/otpRoutes");
+const customerRoutes = require("./routes/customerRoutes");
 app.use("/api/products", productRoutes);
 app.use("/api/checkout", checkoutRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/shipping", shippingRoutes);
+app.use("/api/otp", otpRoutes);
+app.use("/api/customers", customerRoutes);
 
 // Sentry error handler must be before other error middleware
 app.use(Sentry.Handlers.errorHandler());

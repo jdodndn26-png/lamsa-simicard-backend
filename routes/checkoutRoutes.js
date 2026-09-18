@@ -338,7 +338,7 @@ router.put("/:id/financials", authMiddleware, async (req, res) => {
     const order = await Checkout.findByIdAndUpdate(
       req.params.id,
       { total, downPayment, months, monthlyPayment },
-      { new: true }
+      { returnDocument: "after" }
     );
     res.json(order);
   } catch (err) {
