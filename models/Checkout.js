@@ -1,5 +1,14 @@
 const mongoose = require("mongoose");
 
+const statusHistorySchema = new mongoose.Schema(
+  {
+    status: { type: String, required: true },
+    changedAt: { type: Date, default: Date.now },
+    changedBy: { type: String, default: "system" },
+  },
+  { _id: false }
+);
+
 const checkoutSchema = new mongoose.Schema(
   {
     orderId: { type: String, required: true, unique: true },
@@ -13,14 +22,18 @@ const checkoutSchema = new mongoose.Schema(
         name: String,
         price: Number,
         quantity: Number,
+        image: { type: String, default: null },
       },
     ],
     total: { type: Number, required: true },
     downPayment: { type: Number, default: 0 },
     customer: { type: String },
+    customerEmailNormalized: { type: String, default: null },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
     whatsapp: { type: String },
     nationalId: { type: String },
     address: { type: String },
+    statusHistory: { type: [statusHistorySchema], default: [] },
     // Full delivery address from Google Maps
     deliveryAddress: {
       placeId: { type: String, default: null },
@@ -41,7 +54,11 @@ const checkoutSchema = new mongoose.Schema(
     installmentType: { type: String, enum: ["installment", "full"], default: "full" },
     months: { type: Number, default: 0 },
     monthlyPayment: { type: Number, default: 0 },
-    status: { type: String, enum: ["pending", "confirmed", "cancelled"], default: "pending" },
+    status: {
+      type: String,
+      enum: ["pending", "confirmed", "processing", "ready_to_ship", "shipped", "out_for_delivery", "delivered", "cancelled"],
+      default: "pending",
+    },
     shipping: {
       companyId: { type: String },
       companyName: { type: String },
@@ -63,5 +80,7 @@ checkoutSchema.index({ status: 1 });
 checkoutSchema.index({ whatsapp: 1 });
 checkoutSchema.index({ nationalId: 1 });
 checkoutSchema.index({ status: 1, createdAt: -1 });
+checkoutSchema.index({ userId: 1, createdAt: -1 });
+checkoutSchema.index({ customerEmailNormalized: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Checkout", checkoutSchema);

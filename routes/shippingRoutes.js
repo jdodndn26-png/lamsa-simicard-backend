@@ -1,20 +1,14 @@
 const express = require("express");
-const jwt = require("jsonwebtoken");
 const router = express.Router();
 const ShippingCompany = require("../models/ShippingCompany");
 const ShippingCoverage = require("../models/ShippingCoverage");
 const SAUDI_REGIONS = require("../config/saudiRegions");
 const { getShippingOptions } = require("../services/shippingService");
 const { makeImageUpload, uploadToCloudinary, deleteFromCloudinary } = require("../config/cloudinary");
+const authMiddleware = require("../middleware/auth");
 
+const auth = authMiddleware;
 const uploadLogo = makeImageUpload();
-
-function auth(req, res, next) {
-  const token = req.cookies?.admin_token;
-  if (!token) return res.status(401).json({ error: "غير مصرح" });
-  try { req.admin = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ error: "غير مصرح" }); }
-}
 
 // ── Public ──────────────────────────────────────────────
 

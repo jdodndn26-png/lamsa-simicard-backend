@@ -1,19 +1,47 @@
 const Product = require("../models/Product");
 
-// In-memory cache — TTL 60 ثانية
-const cache = new Map();
+// ─── In-memory cache محدودة الحجم مع TTL و LRU-style eviction ────────────────
+// الحد الأقصى 200 مدخلة — يمنع نمو الـ cache بلا حد في الـ server الدائم
 const CACHE_TTL = 60 * 1000;
+const CACHE_MAX_SIZE = 200;
+const cache = new Map();
 
 function getCached(key) {
   const entry = cache.get(key);
   if (!entry) return null;
   if (Date.now() - entry.ts > CACHE_TTL) { cache.delete(key); return null; }
+  // LRU: نحرك الـ entry للنهاية عند الوصول إليها
+  cache.delete(key);
+  cache.set(key, entry);
   return entry.data;
 }
+
 function setCached(key, data) {
+  // إذا امتلأ الـ cache، احذف الأقدم (أول عنصر)
+  if (cache.size >= CACHE_MAX_SIZE) {
+    const oldestKey = cache.keys().next().value;
+    cache.delete(oldestKey);
+  }
   cache.set(key, { data, ts: Date.now() });
 }
-const invalidateCache = () => cache.clear();
+
+// إبطال cache مُستهدف بدل مسح الكل — يمسح فقط مدخلات products
+// مع إبقاء مدخلات أخرى محتملة سليمة
+function invalidateCache(productId) {
+  if (productId) {
+    // احذف المدخلات التي تحتوي على هذا الـ ID
+    for (const key of cache.keys()) {
+      if (key.includes(String(productId))) cache.delete(key);
+    }
+    // احذف أيضاً كل مدخلات قوائم المنتجات (تتأثر بالتغيير)
+    for (const key of cache.keys()) {
+      if (key.startsWith("products:")) cache.delete(key);
+    }
+  } else {
+    // invalidate كامل عند الحاجة (مثل حذف product)
+    cache.clear();
+  }
+}
 exports.invalidateCache = invalidateCache;
 
 function normalizeArabic(str) {
@@ -67,14 +95,58 @@ exports.getProducts = async (req, res) => {
 };
 
 exports.getFeaturedProducts = async (req, res) => {
-  const featured = await Product.find({ inStock: true, isFeatured: true }).sort({ sortOrder: 1, originalPrice: -1 }).limit(6);
-  if (featured.length > 0) return res.json(featured);
+  // cache key ثابت للـ featured
+  const cacheKey = "products:featured";
+  const cached = getCached(cacheKey);
+  if (cached) return res.json(cached);
+
+  const featured = await Product.find({ inStock: true, isFeatured: true })
+    .sort({ sortOrder: 1, originalPrice: -1 })
+    .limit(6)
+    .lean();
+
+  if (featured.length > 0) {
+    setCached(cacheKey, featured);
+    return res.json(featured);
+  }
+
   // fallback: legacy behaviour
   const [stc, mobily] = await Promise.all([
-    Product.find({ inStock: true, brand: { $regex: /^stc/i } }).sort({ originalPrice: -1 }).limit(2),
-    Product.find({ inStock: true, brand: { $regex: /موبايلي/ } }).sort({ originalPrice: -1 }).limit(2),
+    Product.find({ inStock: true, brand: { $regex: /^stc/i } }).sort({ originalPrice: -1 }).limit(2).lean(),
+    Product.find({ inStock: true, brand: { $regex: /موبايلي/ } }).sort({ originalPrice: -1 }).limit(2).lean(),
   ]);
-  res.json([...stc, ...mobily]);
+  const result = [...stc, ...mobily];
+  setCached(cacheKey, result);
+  res.json(result);
+};
+
+// جلب منتجات بـ IDs محددة — بديل الـ 4 requests المنفصلة في MostDemandedSection
+exports.getProductsByIds = async (req, res) => {
+  try {
+    const { ids } = req.query;
+    if (!ids) return res.status(400).json({ message: "ids query param required" });
+
+    const idList = ids.split(",").map((id) => id.trim()).filter(Boolean).slice(0, 20); // حد أقصى 20
+
+    // cache key بناءً على الـ IDs المرتبة — نفس النتيجة بغض النظر عن الترتيب
+    const cacheKey = `products:ids:${[...idList].sort().join(",")}`;
+    const cached = getCached(cacheKey);
+    if (cached) return res.json(cached);
+
+    const mongoose = require("mongoose");
+    const validIds = idList.filter((id) => mongoose.Types.ObjectId.isValid(id));
+    const products = await Product.find({ _id: { $in: validIds } }).lean();
+
+    // نُرتب النتائج بنفس ترتيب الـ IDs المطلوبة
+    const productMap = new Map(products.map((p) => [p._id.toString(), p]));
+    const ordered = idList.map((id) => productMap.get(id)).filter(Boolean);
+
+    setCached(cacheKey, ordered);
+    res.json(ordered);
+  } catch (err) {
+    console.error("getProductsByIds error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
 };
 
 
@@ -113,7 +185,7 @@ exports.createProduct = async (req, res) => {
   if (typeof data.originalPrice !== "number" || data.originalPrice < 0)
     return res.status(400).json({ message: "originalPrice must be a non-negative number" });
   const product = await Product.create(data);
-  invalidateCache();
+  invalidateCache(); // منتج جديد يؤثر على قوائم المنتجات كلها
   res.status(201).json(product);
 };
 
@@ -123,13 +195,13 @@ exports.updateProduct = async (req, res) => {
     return res.status(400).json({ message: "originalPrice must be a non-negative number" });
   const product = await Product.findByIdAndUpdate(req.params.id, data, { new: true, runValidators: true });
   if (!product) return res.status(404).json({ message: "Product not found" });
-  invalidateCache();
+  invalidateCache(req.params.id); // invalidate مُستهدف بالـ ID
   res.json(product);
 };
 
 exports.deleteProduct = async (req, res) => {
   const product = await Product.findByIdAndDelete(req.params.id);
   if (!product) return res.status(404).json({ message: "Product not found" });
-  invalidateCache();
+  invalidateCache(); // حذف يؤثر على الكل
   res.json({ message: "Product deleted" });
 };

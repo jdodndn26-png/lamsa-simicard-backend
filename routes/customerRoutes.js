@@ -493,28 +493,160 @@ router.patch("/profile", requireCustomer, async (req, res) => {
   }
 });
 
+// ─── CLAIM ORDERS (ربط الطلبات بـ userId بعد تسجيل الدخول) ───────────────────
+// POST /api/customers/orders/claim
+// يربط الطلبات اليتيمة بحساب المستخدم عبر الـ email أو الـ whatsapp
+router.post("/orders/claim", requireCustomer, async (req, res) => {
+  try {
+    const customer = await Customer.findById(req.customerId)
+      .select("email phone emailVerified")
+      .lean();
+    if (!customer || !customer.emailVerified)
+      return res.status(403).json({ error: "غير مصرح" });
+
+    const emailNorm = customer.email.toLowerCase().trim();
+    const phoneNorm = normalizePhone(customer.phone);
+
+    const phoneConditions = phoneNorm
+      ? [{ whatsapp: phoneNorm }, { whatsapp: customer.phone }]
+      : [];
+
+    // ربط كل الطلبات المرتبطة بالـ email أو phone وليس عندها userId
+    const result = await Checkout.updateMany(
+      {
+        userId: null,
+        $or: [
+          { customerEmailNormalized: emailNorm },
+          ...phoneConditions,
+        ],
+      },
+      { $set: { userId: customer._id } }
+    );
+
+    return res.json({ ok: true, claimed: result.modifiedCount });
+  } catch (err) {
+    console.error("[orders/claim]", err.message);
+    return res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
 // ─── MY ORDERS ───────────────────────────────────────────────────────────────
 const Checkout = require("../models/Checkout");
 
+function normalizePhone(p) {
+  return (p || "").replace(/[\s\-\(\)]/g, "");
+}
+
 router.get("/orders", requireCustomer, async (req, res) => {
   try {
-    const customer = await Customer.findById(req.customerId).select("email phone").lean();
+    const customer = await Customer.findById(req.customerId)
+      .select("email emailVerified phone")
+      .lean();
     if (!customer) return res.status(401).json({ error: "غير مصرح" });
+    if (!customer.emailVerified)
+      return res.json({ ok: true, orders: [] });
 
-    const orders = await Checkout.find({
+    const emailNorm = customer.email.toLowerCase().trim();
+    const phoneNorm = normalizePhone(customer.phone);
+    const customerId = customer._id;
+
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(20, Math.max(1, parseInt(req.query.limit) || 10));
+    const skip = (page - 1) * limit;
+
+    const SELECT_FIELDS = "orderId items total status statusHistory createdAt shipping updatedAt installmentType months monthlyPayment downPayment deliveryAddress customer whatsapp nationalId address";
+
+    // أولاً: جلب الطلبات المرتبطة مباشرة بـ userId أو عبر email/phone في query واحد
+    const phoneConditions = phoneNorm
+      ? [{ whatsapp: phoneNorm }, { whatsapp: customer.phone }]
+      : [];
+
+    const allOrdersRaw = await Checkout.find({
       $or: [
-        { whatsapp: customer.phone },
-        { customer: { $regex: customer.email, $options: "i" } },
+        { userId: customerId },
+        { userId: null, customerEmailNormalized: emailNorm },
+        ...(phoneNorm ? [{ userId: null, whatsapp: phoneNorm }, { userId: null, whatsapp: customer.phone }] : []),
       ],
     })
       .sort({ createdAt: -1 })
-      .limit(50)
-      .select("orderId items total status createdAt shipping")
+      .select(SELECT_FIELDS)
       .lean();
 
-    return res.json({ ok: true, orders });
+    // إزالة التكرار بالـ _id
+    const seen = new Set();
+    const allOrders = allOrdersRaw.filter((o) => {
+      const key = o._id.toString();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const total = allOrders.length;
+    const orders = allOrders.slice(skip, skip + limit);
+
+    // إضافة صورة المنتج من Product لو مش موجودة في الطلب
+    const Product = require("../models/Product");
+    const missingImageIds = [];
+    for (const order of orders) {
+      for (const item of order.items || []) {
+        if (!item.image && item.productId) missingImageIds.push(item.productId.toString());
+      }
+    }
+    if (missingImageIds.length > 0) {
+      const products = await Product.find({ _id: { $in: missingImageIds } }).select("_id image images").lean();
+      const imgMap = new Map(products.map((p) => [p._id.toString(), p.images?.[0] || p.image || null]));
+      for (const order of orders) {
+        for (const item of order.items || []) {
+          if (!item.image && item.productId) item.image = imgMap.get(item.productId.toString()) || null;
+        }
+      }
+    }
+
+    return res.json({ ok: true, orders, total, page, limit, totalPages: Math.ceil(total / limit) });
   } catch (err) {
     console.error("[orders]", err.message);
+    return res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
+router.get("/orders/:id", requireCustomer, async (req, res) => {
+  try {
+    const customer = await Customer.findById(req.customerId)
+      .select("email emailVerified phone")
+      .lean();
+    if (!customer || !customer.emailVerified)
+      return res.status(403).json({ error: "غير مصرح" });
+
+    const emailNorm = customer.email.toLowerCase().trim();
+    const phoneNorm = normalizePhone(customer.phone);
+
+    const phoneConditions = phoneNorm
+      ? [{ whatsapp: phoneNorm }, { whatsapp: customer.phone }]
+      : [];
+
+    const order = await Checkout.findOne({
+      _id: req.params.id,
+      $or: [{ userId: customer._id }, { customerEmailNormalized: emailNorm }, ...phoneConditions],
+    })
+      .select("orderId items total status statusHistory createdAt shipping deliveryAddress updatedAt installmentType months monthlyPayment downPayment customer whatsapp nationalId address")
+      .lean();
+
+    if (!order) return res.status(404).json({ error: "الطلب غير موجود" });
+
+    // تعويض صور المنتجات المفقودة
+    const Product = require("../models/Product");
+    const missingIds = (order.items || []).filter((i) => !i.image && i.productId).map((i) => i.productId.toString());
+    if (missingIds.length > 0) {
+      const products = await Product.find({ _id: { $in: missingIds } }).select("_id image images").lean();
+      const imgMap = new Map(products.map((p) => [p._id.toString(), p.images?.[0] || p.image || null]));
+      for (const item of order.items || []) {
+        if (!item.image && item.productId) item.image = imgMap.get(item.productId.toString()) || null;
+      }
+    }
+
+    return res.json({ ok: true, order });
+  } catch (err) {
+    console.error("[orders/:id]", err.message);
     return res.status(500).json({ error: "خطأ في الخادم" });
   }
 });

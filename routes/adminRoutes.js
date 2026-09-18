@@ -13,13 +13,21 @@ const Bank = require("../models/Bank");
 const CardFieldSettings = require("../models/CardFieldSettings");
 const { makeImageUpload, makeFileUpload, uploadToCloudinary, deleteFromCloudinary } = require("../config/cloudinary");
 const { invalidateCache } = require("../controllers/productController");
+const authMiddleware = require("../middleware/auth");
 
-const upload = makeImageUpload();
-const uploadBankLogo = makeImageUpload();
-const uploadFooterImg = makeImageUpload();
-const uploadDoc = makeFileUpload();
-const uploadProductImage = makeImageUpload();
-const uploadSubCatImage = makeImageUpload();
+// ─── Fix 9: دمج multer instances ─────────────────────────────────────────────
+// الـ 6 instances القديمة دُمجت في 2 فقط: واحدة للصور وواحدة للملفات
+// كل instances الصور متشابهة تماماً — لا داعي لإنشاء منفصلة لكل route
+const imageUpload = makeImageUpload(); // يُستخدم لكل uploads الصور
+const docUpload = makeFileUpload();    // يُستخدم لـ uploads الملفات
+
+// Aliases للتوافق مع الـ routes الموجودة
+const upload = imageUpload;
+const uploadBankLogo = imageUpload;
+const uploadFooterImg = imageUpload;
+const uploadDoc = docUpload;
+const uploadProductImage = imageUpload;
+const uploadSubCatImage = imageUpload;
 
 const router = express.Router();
 
@@ -94,17 +102,6 @@ function validateCompanyBody(body) {
       errors.push(`${field} يتجاوز الحد المسموح (${max} حرف)`);
   }
   return errors;
-}
-
-function authMiddleware(req, res, next) {
-  const token = req.cookies?.admin_token;
-  if (!token) return res.status(401).json({ error: "غير مصرح" });
-  try {
-    req.admin = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: "غير مصرح" });
-  }
 }
 
 // POST /api/admin/login
@@ -850,7 +847,7 @@ router.get("/orders", authMiddleware, async (req, res) => {
     const skip = (page - 1) * limit;
 
     const filter = {};
-    if (req.query.status && ["pending", "confirmed", "cancelled"].includes(req.query.status)) {
+    if (req.query.status && ["pending", "confirmed", "processing", "ready_to_ship", "shipped", "out_for_delivery", "delivered", "cancelled"].includes(req.query.status)) {
       filter.status = req.query.status;
     }
     if (req.query.search) {
@@ -873,35 +870,46 @@ router.get("/orders", authMiddleware, async (req, res) => {
         filter.createdAt.$lte = to;
       }
     }
-
     const sortField = req.query.sortField || "createdAt";
     const sortDir = req.query.sortDir === "asc" ? 1 : -1;
     const allowedSort = ["createdAt", "total", "status", "customer"];
     const sort = { [allowedSort.includes(sortField) ? sortField : "createdAt"]: sortDir };
-
     const [orders, total] = await Promise.all([
       Checkout.find(filter).sort(sort).skip(skip).limit(limit).lean(),
       Checkout.countDocuments(filter),
     ]);
-
     res.json({ orders, total, page, limit, totalPages: Math.ceil(total / limit) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: "خطأ في الخادم" });
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// PUT /api/admin/orders/:id/status (update order status)
-// Note: Specific route /:id/status must come BEFORE /:id base route
-const ADMIN_VALID_STATUSES = ["pending", "confirmed", "cancelled"];
-const ADMIN_VALID_TRANSITIONS = {
-  pending: ["confirmed", "cancelled"],
-  confirmed: ["cancelled"],
-  cancelled: ["pending"],
-};
+// GET /api/admin/orders/:id
+router.get("/orders/:id", authMiddleware, async (req, res) => {
+  try {
+    const order = await Checkout.findById(req.params.id);
+    if (!order) return res.status(404).json({ ok: false, error: "not found" });
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
+// PUT /api/admin/orders/:id/status
 router.put("/orders/:id/status", authMiddleware, async (req, res) => {
   try {
     const { status } = req.body;
+    const ADMIN_VALID_STATUSES = ["pending", "confirmed", "processing", "ready_to_ship", "shipped", "out_for_delivery", "delivered", "cancelled"];
+    const ADMIN_VALID_TRANSITIONS = {
+      pending: ["confirmed", "cancelled"],
+      confirmed: ["processing", "cancelled"],
+      processing: ["ready_to_ship", "cancelled"],
+      ready_to_ship: ["shipped", "cancelled"],
+      shipped: ["out_for_delivery", "cancelled"],
+      out_for_delivery: ["delivered", "cancelled"],
+      delivered: [],
+      cancelled: ["pending"],
+    };
     if (!ADMIN_VALID_STATUSES.includes(status))
       return res.status(400).json({ ok: false, error: "حالة غير صحيحة" });
     const order = await Checkout.findById(req.params.id);
@@ -909,7 +917,24 @@ router.put("/orders/:id/status", authMiddleware, async (req, res) => {
     if (!ADMIN_VALID_TRANSITIONS[order.status]?.includes(status))
       return res.status(400).json({ ok: false, error: `لا يمكن التحويل من ${order.status} إلى ${status}` });
     order.status = status;
+    order.statusHistory.push({ status, changedAt: new Date(), changedBy: req.admin?.email || "admin" });
     await order.save();
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// PUT /api/admin/orders/:id/financials
+router.put("/orders/:id/financials", authMiddleware, async (req, res) => {
+  try {
+    const { total, downPayment, months, monthlyPayment } = req.body;
+    const order = await Checkout.findByIdAndUpdate(
+      req.params.id,
+      { total, downPayment, months, monthlyPayment },
+      { returnDocument: "after" }
+    );
+    if (!order) return res.status(404).json({ ok: false, error: "not found" });
     res.json(order);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
